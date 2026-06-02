@@ -118,31 +118,23 @@ def _build_pkce_pair() -> tuple[str, str]:
 
 def _open_authorization_page(auth_url: str) -> None:
     parsed_auth_url = urllib.parse.urlparse(auth_url)
+
     if parsed_auth_url.scheme != "https" or not parsed_auth_url.netloc:
         raise RuntimeError("Generated Spotify authorization URL is invalid.")
 
-    xdg_open = shutil.which("xdg-open")
-    if xdg_open:
-        try:
-            subprocess.Popen(
-                [xdg_open, auth_url],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                start_new_session=True,
-            )
-            return
-        except OSError:
-            pass
-
-    if webbrowser.open(auth_url, new=1, autoraise=True):
-        return
-
-    raise RuntimeError(
-        "Unable to open a browser automatically. "
-        f"Open this URL manually to continue: {auth_url}"
-    )
+    try:
+        subprocess.Popen(
+            ["microsoft-edge-stable", auth_url],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError as e:
+        raise RuntimeError(
+            f"Failed to launch Microsoft Edge. Open this URL manually: {auth_url}"
+        ) from e
 
 
 def _validate_redirect_uri(redirect_uri: str) -> urllib.parse.ParseResult:
