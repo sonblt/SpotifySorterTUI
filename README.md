@@ -15,6 +15,8 @@ export SPOTIFY_REDIRECT_URI="http://127.0.0.1:8888/callback"
 python3 tui_input_demo.py
 ```
 
+By default, Spotify authentication opens in Microsoft Edge.
+
 ### Controls
 
 - `c`: connect to Spotify (only when disconnected)
