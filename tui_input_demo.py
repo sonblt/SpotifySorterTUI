@@ -87,6 +87,7 @@ class PlaylistInfo:
 class SpotifySession:
     client_id: str
     token_cache: dict[str, object]
+    current_user_id: str = ""
 
 
 class SpotifyApiError(RuntimeError):
@@ -110,6 +111,7 @@ class UiState:
     creating_playlist: bool = False
     new_playlist_name: str = ""
     session: SpotifySession | None = None
+    move_generation: int = 0
 
 
 def _base64_url_encode(data: bytes) -> str:
@@ -767,8 +769,12 @@ def connect_and_get_session_playlists(
             f"{', '.join(sorted(missing_move_scopes))}. "
             "Remove this app from your Spotify account apps, then reconnect and approve the requested scopes."
         )
-    session = SpotifySession(client_id=client_id, token_cache=tokens)
-    current_user_id = _fetch_current_user_id(session.client_id, session.token_cache)
+    current_user_id = _fetch_current_user_id(client_id, tokens)
+    session = SpotifySession(
+        client_id=client_id,
+        token_cache=tokens,
+        current_user_id=current_user_id,
+    )
     playlists = _sync_playlists(session, current_user_id, status_callback=status_callback)
     return session, playlists
 
@@ -1262,7 +1268,7 @@ def run(stdscr: curses.window) -> None:
         selected_playlist_id: str | None = None,
         opened_playlist_id: str | None = None,
         post_move_tracks_selected_index: int = 0,
-    ) -> None:
+    ) -> int:
         updated_playlists: list[PlaylistInfo] = []
         destination_found = False
 
@@ -1363,6 +1369,8 @@ def run(stdscr: curses.window) -> None:
         state.creating_playlist = False
         state.new_playlist_name = ""
         state.error_message = ""
+        state.move_generation += 1
+        return state.move_generation
 
     def refresh_after_move(
         active_session: SpotifySession,
@@ -1371,6 +1379,7 @@ def run(stdscr: curses.window) -> None:
         selected_playlist_id: str | None,
         opened_playlist_id: str | None,
         post_move_tracks_selected_index: int,
+        expected_move_generation: int,
     ) -> None:
         with connection_lock:
             previous_playlists = list(state.playlists)
@@ -1427,14 +1436,39 @@ def run(stdscr: curses.window) -> None:
             if playlist.id in refreshed_by_id
         ]
         with connection_lock:
+            if state.move_generation != expected_move_generation:
+                return
+            current_selected_playlist_id = None
+            if state.playlists:
+                state.selected_index = _clamp_index(state.selected_index, len(state.playlists))
+                current_selected_playlist_id = state.playlists[state.selected_index].id
+            current_opened_playlist_id = state.opened_playlist_id
+            current_focused_panel = state.focused_panel
+            current_tracks_selected_index = state.tracks_selected_index
+            current_target_playlist_id = None
+            current_target_is_create = state.target_selected_index >= len(state.playlists)
+            if not current_target_is_create and state.playlists:
+                state.target_selected_index = _clamp_index(
+                    state.target_selected_index,
+                    len(state.playlists) + 1,
+                )
+                if state.target_selected_index < len(state.playlists):
+                    current_target_playlist_id = state.playlists[state.target_selected_index].id
+
             state.playlists = reconciled_playlists
-            restored_left_index = _find_playlist_index_by_id(state.playlists, selected_playlist_id)
+            restored_left_index = _find_playlist_index_by_id(
+                state.playlists,
+                current_selected_playlist_id or selected_playlist_id,
+            )
             state.selected_index = (
                 restored_left_index
                 if restored_left_index is not None
                 else _clamp_index(state.selected_index, len(state.playlists))
             )
-            restored_opened = _find_playlist_by_id(state.playlists, opened_playlist_id)
+            restored_opened = _find_playlist_by_id(
+                state.playlists,
+                current_opened_playlist_id or opened_playlist_id,
+            )
             if restored_opened is None:
                 state.opened_playlist_id = None
                 state.tracks_selected_index = 0
@@ -1442,14 +1476,27 @@ def run(stdscr: curses.window) -> None:
             else:
                 state.opened_playlist_id = restored_opened.id
                 state.tracks_selected_index = _clamp_index(
-                    post_move_tracks_selected_index,
+                    current_tracks_selected_index,
                     len(restored_opened.tracks),
                 )
-                state.focused_panel = PANEL_TRACKS
-            state.target_selected_index = _clamp_index(
-                state.target_selected_index,
-                len(state.playlists) + 1,
-            )
+                if current_focused_panel == PANEL_TARGETS and not restored_opened.tracks:
+                    state.focused_panel = PANEL_TRACKS
+                elif current_focused_panel in {PANEL_TRACKS, PANEL_TARGETS}:
+                    state.focused_panel = current_focused_panel
+                else:
+                    state.focused_panel = PANEL_PLAYLISTS
+            if current_target_is_create:
+                state.target_selected_index = len(state.playlists)
+            else:
+                restored_target_index = _find_playlist_index_by_id(
+                    state.playlists,
+                    current_target_playlist_id,
+                )
+                state.target_selected_index = (
+                    restored_target_index
+                    if restored_target_index is not None
+                    else _clamp_index(state.target_selected_index, len(state.playlists) + 1)
+                )
             state.error_message = ""
             state.status_message = f"Move verified with Spotify at {time.strftime('%H:%M:%S')}."
 
@@ -1465,7 +1512,6 @@ def run(stdscr: curses.window) -> None:
             active_session.token_cache,
             source_playlist_id,
             preferred_position,
-            force_refresh=True,
         )
         if current_track is None:
             raise RuntimeError(
@@ -1476,6 +1522,37 @@ def run(stdscr: curses.window) -> None:
                 "Selected song changed on Spotify before move. Sync completed; try again."
             )
         return preferred_position, fallback_snapshot_id
+
+    def verify_move_worker(
+        active_session: SpotifySession,
+        current_user_id: str,
+        affected_playlist_ids: set[str],
+        selected_playlist_id: str | None,
+        opened_playlist_id: str | None,
+        post_move_tracks_selected_index: int,
+        expected_move_generation: int,
+    ) -> None:
+        try:
+            refresh_after_move(
+                active_session,
+                current_user_id,
+                affected_playlist_ids,
+                selected_playlist_id,
+                opened_playlist_id,
+                post_move_tracks_selected_index,
+                expected_move_generation,
+            )
+        except (
+            RuntimeError,
+            TimeoutError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            SpotifyApiError,
+        ) as exc:
+            with connection_lock:
+                if state.move_generation == expected_move_generation:
+                    state.error_message = f"Moved song, but refresh failed: {exc}"
 
     def move_track_worker(
         source_playlist_id: str,
@@ -1512,9 +1589,13 @@ def run(stdscr: curses.window) -> None:
             resolved_destination_playlist_id = destination_playlist_id
             created_playlist_name = ""
             created_playlist: PlaylistInfo | None = None
-            current_user_id = ""
+            current_user_id = active_session.current_user_id
             if resolved_destination_playlist_id is None:
-                current_user_id = _fetch_current_user_id(active_session.client_id, active_session.token_cache)
+                if not current_user_id:
+                    current_user_id = _fetch_current_user_id(
+                        active_session.client_id,
+                        active_session.token_cache,
+                    )
                 created_playlist = _create_playlist(
                     active_session.client_id,
                     active_session.token_cache,
@@ -1537,7 +1618,10 @@ def run(stdscr: curses.window) -> None:
                     state.playlists,
                     resolved_destination_playlist_id,
                 )
-            if created_playlist is None:
+            if created_playlist is None and (
+                destination_playlist_before_add is None
+                or not destination_playlist_before_add.owner_id
+            ):
                 try:
                     fetched_destination_playlist = _fetch_playlist_details(
                         active_session.client_id,
@@ -1643,7 +1727,7 @@ def run(stdscr: curses.window) -> None:
                         snapshot_id=destination_snapshot_id,
                         public=False if created_playlist_name else None,
                     )
-                apply_local_move(
+                verification_generation = apply_local_move(
                     source_playlist_id,
                     source_track,
                     current_source_track_position,
@@ -1656,31 +1740,25 @@ def run(stdscr: curses.window) -> None:
                 )
                 if created_playlist_name:
                     state.status_message = (
-                        f"Created playlist '{created_playlist_name}' and moved selected song. Verifying..."
+                        f"Created playlist '{created_playlist_name}' and moved selected song. Verifying in background..."
                     )
                 else:
-                    state.status_message = "Moved selected song. Verifying..."
+                    state.status_message = "Moved selected song. Verifying in background..."
 
             affected_playlist_ids = {source_playlist_id, resolved_destination_playlist_id}
-            try:
-                refresh_after_move(
+            threading.Thread(
+                target=verify_move_worker,
+                args=(
                     active_session,
                     current_user_id,
                     affected_playlist_ids,
                     selected_playlist_id,
                     opened_playlist_id,
                     post_move_tracks_selected_index,
-                )
-            except (
-                RuntimeError,
-                TimeoutError,
-                urllib.error.URLError,
-                json.JSONDecodeError,
-                UnicodeDecodeError,
-                SpotifyApiError,
-            ) as exc:
-                with connection_lock:
-                    state.error_message = f"Moved song, but refresh failed: {exc}"
+                    verification_generation,
+                ),
+                daemon=True,
+            ).start()
             threading.Thread(target=preload_playlist_tracks_worker, daemon=True).start()
         except (
             RuntimeError,
